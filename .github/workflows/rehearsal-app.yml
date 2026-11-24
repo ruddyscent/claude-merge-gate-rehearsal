@@ -1,0 +1,79 @@
+name: Dedicated app rehearsal
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_run:
+    workflows: [Rehearsal review signal, Rehearsal independent CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' && vars.REHEARSAL_APP_ENABLED == 'true' && github.repository == 'ruddyscent/claude-merge-gate-rehearsal'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    environment: rehearsal-status-app
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc
+        id: publisher
+        with:
+          app-id: '5894090'
+          private-key: ${{ secrets.REHEARSAL_APP_PRIVATE_KEY }}
+          permission-statuses: write
+      - name: Publish a synthetic head verdict
+        env:
+          PUBLISHER_TOKEN: ${{ steps.publisher.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="repos/$GITHUB_REPOSITORY"
+          path="$GITHUB_EVENT_PATH"
+          main=$(gh api "$repo/git/ref/heads/main" --jq .object.sha)
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch) prs=$(jq -r .inputs.pr "$path");;
+            pull_request_target) prs=$(jq -r .pull_request.number "$path");;
+            push|workflow_run)
+              prs=$(gh api "$repo/pulls?state=open&base=main" --jq '.[].number');;
+          esac
+          for pr in $prs; do
+            [[ "$pr" =~ ^[1-9][0-9]*$ ]] || exit 1
+            data=$(gh api "$repo/pulls/$pr")
+            head=$(jq -r .head.sha <<<"$data")
+            [[ "$head" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            state=failure
+            if jq -e --arg repo "$GITHUB_REPOSITORY" --arg base "$main" '
+              .state == "open" and (.draft | not) and .head.repo.full_name == $repo
+              and .base.ref == "main" and .base.sha == $base' <<<"$data" >/dev/null; then
+              kind=$(jq -r .head.ref <<<"$data")
+              case "$kind" in
+                fixture-ci)
+                  runs=$(gh api "$repo/actions/workflows/rehearsal-ci.yml/runs?event=pull_request&head_sha=$head")
+                  counted=$(jq --argjson pr "$pr" '[.workflow_runs[] | select(.conclusion == "success" and any(.pull_requests[]; .number == $pr))] | length' <<<"$runs")
+                  [[ "$counted" == 0 ]] || state=success
+                  ;;
+                fixture-pass) state=success ;;
+                fixture-review)
+                  review="REHEARSAL $pr $head $main finding-1 finding-2"
+                  count=$(gh api --paginate --slurp "$repo/pulls/$pr/reviews" |
+                    jq --arg head "$head" --arg owner "${GITHUB_REPOSITORY%%/*}" --arg review "$review" '
+                      flatten | map(select(.commit_id == $head and .state == "COMMENTED"
+                      and .user.login == $owner and .body == $review)) | length')
+                  [[ "$count" != 1 ]] || state=success
+                  ;;
+              esac
+            fi
+            GH_TOKEN="$PUBLISHER_TOKEN" gh api "$repo/statuses/$head" --method POST -f state="$state" \
+              -f context="Synthetic app merge eligibility" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --silent
+          done

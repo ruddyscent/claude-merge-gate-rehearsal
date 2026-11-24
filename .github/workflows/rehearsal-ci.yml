@@ -1,0 +1,13 @@
+name: Rehearsal independent CI
+on:
+  pull_request:
+    branches: [main]
+permissions: {}
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Pass only the fictional CI scenario
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: test "$BRANCH" = fixture-ci
